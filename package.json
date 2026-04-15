@@ -3,7 +3,7 @@
   "displayName": "Tote",
   "description": "Keeps temporary notes and todo list while developing to improve DX",
   "publisher": "kito-arch",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "engines": {
     "vscode": "^1.115.0"
   },

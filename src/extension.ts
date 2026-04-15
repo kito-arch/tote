@@ -20,6 +20,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       panel.webview.onDidReceiveMessage(async (msg) => {
         let lastAdded: string | undefined;
+        let updatedId: string | undefined;
         switch (msg.type) {
           case "add": {
             const result = await storage.addNote(notes, msg.note);
@@ -29,12 +30,18 @@ export function activate(context: vscode.ExtensionContext) {
           }
           case "update":
             notes = await storage.updateNote(notes, msg.id, msg.changes);
+            updatedId = msg.id;
             break;
           case "delete":
             notes = await storage.deleteNote(notes, msg.id);
             break;
         }
-        panel.webview.postMessage({ type: "sync", notes, lastAdded });
+        panel.webview.postMessage({
+          type: "sync",
+          notes,
+          lastAdded,
+          updatedId,
+        });
       });
     }),
   );
@@ -42,6 +49,10 @@ export function activate(context: vscode.ExtensionContext) {
 
 function getWebviewContent(notes: Note[]): string {
   const data = JSON.stringify(notes);
+  return buildWebviewHtml(data);
+}
+
+function buildWebviewHtml(data: string): string {
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -150,15 +161,54 @@ function getWebviewContent(notes: Note[]): string {
       overflow: hidden;
     }
 
+    /* ── Sidebar toggle btn ── */
+    #sidebar-toggle {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 2px 4px;
+      border-radius: 3px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    #sidebar-toggle:hover { color: var(--fg); background: var(--vscode-toolbar-hoverBackground); }
+
     /* ── Tree sidebar ── */
     #sidebar {
-      width: 200px;
-      min-width: 140px;
+      width: 120px;
+      min-width: 120px;
       border-right: 1px solid var(--border);
       overflow-y: auto;
       flex-shrink: 0;
       padding: 8px 0;
+      transition: width 0.2s ease;
     }
+
+    #sidebar.hidden {
+      width: 0 !important;
+      min-width: 0 !important;
+      overflow: hidden;
+      border-right: none;
+      padding: 0;
+    }
+
+    #resizer.sidebar-hidden { display: none; }
+
+    /* ── Resize handle ── */
+    #resizer {
+      width: 4px;
+      flex-shrink: 0;
+      cursor: col-resize;
+      background: transparent;
+      transition: background 0.15s;
+      position: relative;
+      z-index: 10;
+    }
+
+    #resizer:hover,
+    #resizer.dragging { background: var(--accent); }
 
     .tree-folder {
       user-select: none;
@@ -252,6 +302,28 @@ function getWebviewContent(notes: Note[]): string {
 
     .note-card:focus-within { border-color: var(--accent); }
 
+    .tree-item.note-hidden { opacity: 0.45; font-style: italic; }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+
+    .minimize-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      padding: 2px 5px;
+      border-radius: 3px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .minimize-btn:hover { color: var(--fg); background: var(--vscode-toolbar-hoverBackground); }
+
     .note-header {
       display: flex;
       align-items: center;
@@ -297,9 +369,9 @@ function getWebviewContent(notes: Note[]): string {
       border: none;
       color: var(--muted);
       cursor: pointer;
-      padding: 2px 4px;
+      padding: 2px 5px;
       border-radius: 3px;
-      font-size: 13px;
+      font-size: 12px;
       line-height: 1;
       flex-shrink: 0;
     }
@@ -416,6 +488,7 @@ function getWebviewContent(notes: Note[]): string {
 
 <div id="layout">
   <nav id="sidebar"></nav>
+  <div id="resizer"></div>
   <div id="main"></div>
 </div>
 
@@ -425,6 +498,9 @@ function getWebviewContent(notes: Note[]): string {
   let activeId = notes.length ? notes[0].id : null;
   let searchQuery = '';
   let collapsed = {}; // folder collapse state by type
+  let hiddenNotes = new Set(); // note ids removed from main view
+  let sidebarHidden = false;   // whether sidebar is manually hidden
+  let sidebarWasAutoShown = false; // true when sidebar shown only because of search
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -446,7 +522,7 @@ function getWebviewContent(notes: Note[]): string {
   function escapeRe(s) {
     // Split the special-char string so that dollar+brace never appears as a
     // literal sequence inside this TypeScript template literal.
-    var specials = new RegExp('[.*+?^$' + '{}()|[\\]\\\\]', 'g');
+    var specials = new RegExp('[.*+?^$' + '{}()|[\\]\]', 'g');
     return s.replace(specials, '\\$&');
   }
 
@@ -473,6 +549,11 @@ function getWebviewContent(notes: Note[]): string {
 
   function renderSidebar() {
     const sidebar = document.getElementById('sidebar');
+    const resizer = document.getElementById('resizer');
+    // Show sidebar if searching, even if manually hidden
+    const shouldShow = !sidebarHidden || searchQuery;
+    sidebar.classList.toggle('hidden', !shouldShow);
+    resizer.classList.toggle('sidebar-hidden', !shouldShow);
     const visible = visibleNotes();
     const byType = { text: [], checklist: [] };
     visible.forEach(n => byType[n.type].push(n));
@@ -488,20 +569,10 @@ function getWebviewContent(notes: Note[]): string {
       const open = !collapsed[f.key];
       const rows = items.map(n => {
         const active = n.id === activeId ? ' active' : '';
-        return \`<div class="tree-item\${active}" onclick="setActive('\${esc(n.id)}')" title="\${esc(n.title)}">
-          <span class="tree-item-icon">\${f.icon}</span>
-          <span class="tree-item-label">\${highlight(n.title)}</span>
-        </div>\`;
+        const hidden = hiddenNotes.has(n.id) ? ' note-hidden' : '';
+        return \`<div class=\"tree-item\${active}\${hidden}\" onclick=\"openFromSidebar('\${esc(n.id)}')\" title=\"\${esc(n.title)}\">\n          <span class=\"tree-item-icon\">\${f.icon}</span>\n          <span class=\"tree-item-label\">\${highlight(n.title)}</span>\n        </div>\`;
       }).join('');
-      return \`
-        <div class="tree-folder">
-          <div class="tree-folder-label" onclick="toggleFolder('\${f.key}')">
-            <span class="folder-arrow \${open ? 'open' : ''}">\u25B6</span>
-            \${f.label}
-            <span style="margin-left:auto;font-size:10px;opacity:0.6">\${items.length}</span>
-          </div>
-          \${open ? \`<div class="tree-items">\${rows}</div>\` : ''}
-        </div>\`;
+      return \`\n        <div class=\"tree-folder\">\n          <div class=\"tree-folder-label\" onclick=\"toggleFolder('\${f.key}')\">\n            <span class=\"folder-arrow \${open ? 'open' : ''}\">\u25B6</span>\n            \${f.label}\n            <span style=\"margin-left:auto;font-size:10px;opacity:0.6\">\${items.length}</span>\n          </div>\n          \${open ? \`<div class=\"tree-items\">\${rows}</div>\` : ''}\n        </div>\`;
     }).join('');
   }
 
@@ -520,6 +591,27 @@ function getWebviewContent(notes: Note[]): string {
     }, 50);
   }
 
+  function openFromSidebar(id) {
+    // If note is hidden, restore it to the main view then scroll to it
+    hiddenNotes.delete(id);
+    setActive(id);
+  }
+
+  function hideNote(id) {
+    hiddenNotes.add(id);
+    // If this was the active note, move focus to next visible
+    if (activeId === id) {
+      const shown = notes.filter(n => !hiddenNotes.has(n.id));
+      activeId = shown.length ? shown[0].id : null;
+    }
+    render();
+  }
+
+  function toggleSidebar() {
+    sidebarHidden = !sidebarHidden;
+    render();
+  }
+
   // ── Main area ─────────────────────────────────────────────────────────────
 
   function renderMain() {
@@ -527,18 +619,15 @@ function getWebviewContent(notes: Note[]): string {
     const visible = visibleNotes();
 
     if (visible.length === 0) {
-      main.innerHTML = \`
-        <div id="empty-state">
-          <div class="big">📭</div>
-          <div>\${searchQuery ? 'No notes match "' + esc(searchQuery) + '"' : 'No notes yet — add one above'}</div>
-        </div>\`;
+      main.innerHTML = \`\n        <div id=\"empty-state\">\n          <div class=\"big\">📭</div>\n          <div>\${searchQuery ? 'No notes match "' + esc(searchQuery) + '"' : 'No notes yet — add one above'}</div>\n        </div>\`;
       return;
     }
 
-    main.innerHTML = visible.map(n => renderCard(n)).join('');
+    const shown = visible.filter(n => !hiddenNotes.has(n.id));
+    main.innerHTML = shown.map(n => renderCard(n)).join('');
 
     // Restore textarea values (innerHTML strips them on re-render)
-    visible.forEach(n => {
+    shown.forEach(n => {
       if (n.type === 'text') {
         const ta = document.getElementById('ta-' + n.id);
         if (ta) ta.value = n.content ?? '';
@@ -547,57 +636,30 @@ function getWebviewContent(notes: Note[]): string {
   }
 
   function renderCard(note) {
-    const active = note.id === activeId ? ' style="border-color:var(--accent)"' : '';
-    const header = \`
-      <div class="note-header">
-        <span class="note-type-badge">\${note.type === 'text' ? 'TXT' : 'LIST'}</span>
-        <input class="note-title-input"
-               value="\${esc(note.title)}"
-               placeholder="Untitled"
-               onchange="updateTitle('\${esc(note.id)}', this.value)"
-               title="Click to rename">
-        <span class="note-meta">\${fmtDate(note.updatedAt)}</span>
-        <button class="delete-btn" onclick="deleteNote('\${esc(note.id)}')" title="Delete note">✕</button>
-      </div>\`;
+    const active = note.id === activeId ? ' style=\"border-color:var(--accent)\"' : '';
+    const header = \`\n      <div class=\"note-header\">\n        <span class=\"note-type-badge\">\${note.type === 'text' ? 'TXT' : 'LIST'}</span>\n        <input class=\"note-title-input\"\n               value=\"\${esc(note.title)}\"\n               placeholder=\"Untitled\"\n               onchange=\"updateTitle('\${esc(note.id)}', this.value)\"\n               title=\"Click to rename\">\n        <span class=\"note-meta\">\${fmtDate(note.updatedAt)}</span>\n        <div class=\"header-actions\">\n          <button class=\"minimize-btn\" onclick=\"hideNote('\${esc(note.id)}')\" title=\"Hide from view (reopen from sidebar)\">&#8212;</button>\n          <button class=\"delete-btn\" onclick=\"deleteNote('\${esc(note.id)}')\" title=\"Delete note permanently\">&#128465;</button>\n        </div>\n      </div>\`;
 
     let body = '';
     if (note.type === 'text') {
       // Use textarea without innerHTML to avoid escaping issues
-      body = \`<div class="note-body">
-        <textarea id="ta-\${esc(note.id)}" class="note-textarea" rows="6"
-          oninput="scheduleUpdate('\${esc(note.id)}', this.value)"
-          placeholder="Start writing…"></textarea>
-      </div>\`;
+      body = \`<div class=\"note-body\">\n        <textarea id=\"ta-\${esc(note.id)}\" class=\"note-textarea\" rows=\"6\"\n          oninput=\"scheduleUpdate('\${esc(note.id)}', this.value)\"\n          placeholder=\"Start writing…\"></textarea>\n      </div>\`;
     } else {
-      const items = (note.items ?? []).map((item, j) => \`
-        <div class="checklist-row" id="row-\${esc(note.id)}-\${j}">
-          <input type="checkbox" \${item.checked ? 'checked' : ''}
-                 onchange="toggleItem('\${esc(note.id)}', \${j}, this.checked)">
-          <input type="text" class="item-text \${item.checked ? 'done' : ''}"
-                 value="\${esc(item.text)}"
-                 placeholder="Item…"
-                 oninput="scheduleItemUpdate('\${esc(note.id)}', \${j}, this.value)"
-                 onkeydown="itemKeydown(event, '\${esc(note.id)}', \${j})">
-          <button class="remove-item" onclick="removeItem('\${esc(note.id)}', \${j})" title="Remove">✕</button>
-        </div>
-      \`).join('');
-      body = \`<div class="note-body">
-        <div class="checklist-list">\${items}</div>
-        <button class="add-item-btn" onclick="addItem('\${esc(note.id)}')">＋ add item</button>
-      </div>\`;
+      const items = (note.items ?? []).map((item, j) => \`\n        <div class=\"checklist-row\" id=\"row-\${esc(note.id)}-\${j}\">\n          <input type=\"checkbox\" \${item.checked ? 'checked' : ''}\n                 onchange=\"toggleItem('\${esc(note.id)}', \${j}, this.checked)\">\n          <input type=\"text\" class=\"item-text \${item.checked ? 'done' : ''}\"\n                 value=\"\${esc(item.text)}\"\n                 placeholder=\"Item…\"\n                 oninput=\"scheduleItemUpdate('\${esc(note.id)}', \${j}, this.value)\"\n                 onkeydown=\"itemKeydown(event, '\${esc(note.id)}', \${j})\">\n          <button class=\"remove-item\" onclick=\"removeItem('\${esc(note.id)}', \${j})\" title=\"Remove\">✕</button>\n        </div>\n      \`).join('');
+      body = \`<div class=\"note-body\">\n        <div class=\"checklist-list\">\${items}</div>\n        <button class=\"add-item-btn\" onclick=\"addItem('\${esc(note.id)}')\">＋ add item</button>\n      </div>\`;
     }
 
-    return \`<div class="note-card" id="card-\${esc(note.id)}"\${active}>\${header}\${body}</div>\`;
+    return \`<div class=\"note-card\" id=\"card-\${esc(note.id)}\"\${active}>\${header}\${body}</div>\`;
   }
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────-
 
   function render() {
     renderSidebar();
+    console.debug && console.debug('[tote] render', { activeId, searchQuery, notesCount: notes.length });
     renderMain();
   }
 
-  // ── Search ────────────────────────────────────────────────────────────────
+  // ── Search ───────────────────────────────────────────────────────────────-
 
   function onSearch(val) {
     searchQuery = val.trim();
@@ -636,8 +698,32 @@ function getWebviewContent(notes: Note[]): string {
   // Debounced content save so every keystroke doesn't hammer the filesystem
   const pendingUpdates = {};
   function scheduleUpdate(id, content) {
+    // Optimistically update local state so incoming syncs match what the
+    // user typed and we can skip a full re-render when the host echoes us.
+    const note = notes.find(n => n.id === id);
+    if (note) note.content = content;
+
     clearTimeout(pendingUpdates[id]);
     pendingUpdates[id] = setTimeout(() => {
+      try { console.debug && console.debug('[tote] sending update', { id, type: 'content' }); } catch (e) {}
+      // If the textarea is still focused, defer sending until blur to avoid
+      // the host echoing back a sync while the user is typing (which can
+      // cause a visible blur). Attach a one-time blur handler instead.
+      const ta = document.getElementById('ta-' + id);
+      if (ta && document.activeElement === ta) {
+        if (!ta.__toteBlurBound) {
+          const onBlur = () => {
+            try { console.debug && console.debug('[tote] sending update on blur', { id, type: 'content' }); } catch (e) {}
+            ta.removeEventListener('blur', onBlur);
+            ta.__toteBlurBound = false;
+            vscode.postMessage({ type: 'update', id, changes: { content } });
+          };
+          ta.__toteBlurBound = true;
+          ta.addEventListener('blur', onBlur);
+        }
+        return;
+      }
+
       vscode.postMessage({ type: 'update', id, changes: { content } });
     }, 400);
   }
@@ -654,9 +740,37 @@ function getWebviewContent(notes: Note[]): string {
 
   const pendingItemUpdates = {};
   function scheduleItemUpdate(id, j, text) {
+    // Update local notes immediately so the UI reflects edits optimistically
+    const local = notes.find(n => n.id === id);
+    if (local) {
+      local.items = (local.items ?? []).map((it, i) => i === j ? { ...it, text } : it);
+    }
+
     const key = id + ':' + j;
     clearTimeout(pendingItemUpdates[key]);
     pendingItemUpdates[key] = setTimeout(() => {
+      try { console.debug && console.debug('[tote] sending update', { id, index: j, type: 'item' }); } catch (e) {}
+      // If the checklist input is still focused, defer sending until blur
+      // to avoid the host echoing back a sync while the user is typing.
+      const rowEl = document.getElementById('row-' + id + '-' + j);
+      const inputEl = rowEl ? rowEl.querySelector('.item-text') : null;
+      if (inputEl && document.activeElement === inputEl) {
+        if (!inputEl.__toteBlurBound) {
+          const onBlur = () => {
+            try { console.debug && console.debug('[tote] sending update on blur', { id, index: j, type: 'item' }); } catch (e) {}
+            inputEl.removeEventListener('blur', onBlur);
+            inputEl.__toteBlurBound = false;
+            const note = notes.find(n => n.id === id);
+            if (!note) return;
+            const items = note.items.map((item, i) => i === j ? { ...item, text } : item);
+            vscode.postMessage({ type: 'update', id, changes: { items } });
+          };
+          inputEl.__toteBlurBound = true;
+          inputEl.addEventListener('blur', onBlur);
+        }
+        return;
+      }
+
       const note = notes.find(n => n.id === id);
       if (!note) return;
       const items = note.items.map((item, i) => i === j ? { ...item, text } : item);
@@ -686,7 +800,7 @@ function getWebviewContent(notes: Note[]): string {
     }
   }
 
-  // ── Sync from host ────────────────────────────────────────────────────────
+  // ── Sync from host ──────────────────────────────────────────────────────
 
   window.addEventListener('message', (event) => {
     if (event.data.type === 'sync') {
@@ -694,6 +808,104 @@ function getWebviewContent(notes: Note[]): string {
       const focused = document.activeElement;
       const focusedId = focused?.id;
       const cursorPos = focused?.selectionStart;
+      const incoming = event.data.notes;
+      try { console.debug && console.debug('[tote] sync received', event.data, { focusedId, focusedTag: focused?.tagName }); } catch (e) {}
+
+      // If the host is echoing back an update we just sent, and the
+      // focused element belongs to that note, skip a full re-render to
+      // prevent a visible blur. 'updatedId' is set by the extension when it
+      // responds to our own 'update' message.
+      const updatedId = event.data.updatedId;
+      if (updatedId && focused) {
+        let focusedNoteId = null;
+        if (focused.tagName === 'INPUT' && focused.classList && focused.classList.contains('item-text')) {
+          const row = focused.closest ? focused.closest('.checklist-row') : (focused.parentElement || null);
+          if (row && row.id) {
+            const m = row.id.match(/^row-(.+)-(\d+)$/);
+            if (m) focusedNoteId = m[1];
+          }
+        } else if (focused.tagName === 'INPUT' && focused.classList && focused.classList.contains('note-title-input')) {
+          const card = focused.closest ? focused.closest('.note-card') : (focused.parentElement || null);
+          if (card && card.id) {
+            const m = card.id.match(/^card-(.+)$/);
+            if (m) focusedNoteId = m[1];
+          }
+        } else if (focusedId && focusedId.startsWith && focusedId.startsWith('ta-')) {
+          focusedNoteId = focusedId.slice(3);
+        }
+        if (focusedNoteId && updatedId === focusedNoteId) {
+          notes = incoming;
+          if (event.data.lastAdded) activeId = event.data.lastAdded;
+          return;
+        }
+      }
+
+      // If focused element is a checklist item input, attempt to avoid a
+      // full re-render when the incoming content for that item matches the
+      // focused value or the in-memory value. This prevents the input from
+      // blurring/refocusing on every autosave.
+      if (focused && focused.tagName === 'INPUT' && focused.classList && focused.classList.contains('item-text')) {
+        const row = focused.closest ? focused.closest('.checklist-row') : (focused.parentElement || null);
+        if (row && row.id) {
+          const m = row.id.match(/^row-(.+)-(\d+)$/);
+          if (m) {
+            const noteId = m[1];
+            const idx = parseInt(m[2], 10);
+            const incomingNote = incoming.find(n => n.id === noteId);
+            const localNote = notes.find(n => n.id === noteId);
+            const focusedValue = focused.value ?? '';
+            const incomingValue = (incomingNote && incomingNote.items && incomingNote.items[idx] && (incomingNote.items[idx].text ?? '')) || '';
+            const localValue = (localNote && localNote.items && localNote.items[idx] && (localNote.items[idx].text ?? '')) || '';
+            if (incomingNote && (incomingValue === focusedValue || incomingValue === localValue)) {
+              notes = incoming;
+              if (event.data.lastAdded) activeId = event.data.lastAdded;
+              return;
+            }
+          }
+        }
+      }
+
+      // If focused element is a note title input, similarly avoid re-render
+      // when title hasn't actually changed on disk.
+      if (focused && focused.tagName === 'INPUT' && focused.classList && focused.classList.contains('note-title-input')) {
+        const card = focused.closest ? focused.closest('.note-card') : (focused.parentElement || null);
+        if (card && card.id) {
+          const m = card.id.match(/^card-(.+)$/);
+          if (m) {
+            const noteId = m[1];
+            const incomingNote = incoming.find(n => n.id === noteId);
+            const localNote = notes.find(n => n.id === noteId);
+            const focusedValue = focused.value ?? '';
+            const incomingTitle = incomingNote ? (incomingNote.title ?? '') : '';
+            const localTitle = localNote ? (localNote.title ?? '') : '';
+            if (incomingNote && (incomingTitle === focusedValue || incomingTitle === localTitle)) {
+              notes = incoming;
+              if (event.data.lastAdded) activeId = event.data.lastAdded;
+              return;
+            }
+          }
+        }
+      }
+
+      // If user is actively editing a text note, avoid a full re-render when
+      // the incoming content matches what's already in the textarea or
+      // matches the in-memory note. This prevents the textarea from
+      // blurring/refocusing on every autosave.
+      if (focusedId && focusedId.startsWith && focusedId.startsWith('ta-')) {
+        const noteId = focusedId.slice(3);
+        const incomingNote = incoming.find(n => n.id === noteId);
+        const localNote = notes.find(n => n.id === noteId);
+        const focusedValue = focused?.value ?? '';
+        const incomingContent = (incomingNote && (incomingNote.content ?? '')) || '';
+        const localContent = (localNote && (localNote.content ?? '')) || '';
+
+        if (incomingNote && (incomingContent === focusedValue || incomingContent === localContent)) {
+          // Update memory but skip DOM re-render to avoid blurring the textarea
+          notes = incoming;
+          if (event.data.lastAdded) activeId = event.data.lastAdded;
+          return;
+        }
+      }
 
       notes = event.data.notes;
 
@@ -712,6 +924,39 @@ function getWebviewContent(notes: Note[]): string {
       }
     }
   });
+
+  // ── Sidebar resize ───────────────────────────────────────────────────────────
+  (function() {
+    var resizer  = document.getElementById('resizer');
+    var sidebar  = document.getElementById('sidebar');
+    var MIN_W = 140;
+    var MAX_W = 400;
+    var startX, startW;
+
+    resizer.addEventListener('mousedown', function(e) {
+      startX = e.clientX;
+      startW = sidebar.getBoundingClientRect().width;
+      resizer.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+
+      function onMove(e) {
+        var newW = Math.min(MAX_W, Math.max(MIN_W, startW + (e.clientX - startX)));
+        sidebar.style.width = newW + 'px';
+      }
+
+      function onUp() {
+        resizer.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  })();
 
   // ── Boot ──────────────────────────────────────────────────────────────────
   render();
