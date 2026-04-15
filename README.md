@@ -21,3 +21,7 @@ Tote: Open
 ```
 
 This will open the Tote panel in a column view, where you can add, edit, and manage your notes and tasks.
+
+## Tote in Action
+
+![Tote in Action](assets/screenshot.png)

@@ -3,7 +3,7 @@
   "displayName": "Tote",
   "description": "Keeps temporary notes and todo list while developing to improve DX",
   "publisher": "kito-arch",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "engines": {
     "vscode": "^1.115.0"
   },
@@ -25,6 +25,15 @@
       }
     ]
   },
+  "keywords": [
+    "notes",
+    "todo",
+    "DX",
+    "extension",
+    "developer tools",
+    "productivity",
+    "lightweight"
+  ],
   "scripts": {
     "vscode:prepublish": "pnpm run package",
     "compile": "webpack",
